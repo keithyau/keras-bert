@@ -1,3 +1,22 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+#!pip install "tensorflow>=1.14.0"
+#!pip install --ignore-installed --upgrade tensorflow-gpu
+#!pip install "tensorflow_hub==0.4.0"
+#!pip install -q seaborn
+#!pip install bert-tensorflow
+#!pip install -q keras --upgrade
+#!pip install -q Keras-Applications
+
+#Windows based convenient way of GPU
+#!conda install tensorflow-gpu tqdm
+#!conda install -c conda-forge ipywidgets tensorflow-hub pandas
+#!jupyter nbextension enable --py widgetsnbextension
+
 import tensorflow as tf
 import pandas as pd
 import tensorflow_hub as hub
@@ -5,46 +24,92 @@ import os
 import re
 import numpy as np
 from bert.tokenization import FullTokenizer
-from tqdm import tqdm
+from tqdm import tqdm_notebook
 from tensorflow.keras import backend as K
 
 # Initialize session
-sess = tf.Session()
+from keras.backend.tensorflow_backend import set_session 
+config = tf.ConfigProto() 
+config.gpu_options.allocator_type = 'BFC' 
+config.gpu_options.allow_growth = True
+
+#A "Best-fit with coalescing" algorithm, simplified from a version of dlmalloc. 
+config.gpu_options.per_process_gpu_memory_fraction = 0.7
+
+sess = tf.Session(config=config)
+
+# Params for bert model and tokenization
+bert_path = "https://tfhub.dev/google/bert_uncased_L-12_H-768_A-12/1"
+max_seq_length = 256
+
+
+# # Data
+# 
+# First, we load the sample data IMDB data
+
+# In[2]:
 
 
 # Load all files from a directory in a DataFrame.
 def load_directory_data(directory):
-    data = {}
-    data["sentence"] = []
-    data["sentiment"] = []
-    for file_path in os.listdir(directory):
-        with tf.gfile.GFile(os.path.join(directory, file_path), "r") as f:
-            data["sentence"].append(f.read())
-            data["sentiment"].append(re.match("\d+_(\d+)\.txt", file_path).group(1))
-    return pd.DataFrame.from_dict(data)
-
+  data = {}
+  data["sentence"] = []
+  data["sentiment"] = []
+  for file_path in os.listdir(directory):
+    with tf.gfile.GFile(os.path.join(directory, file_path), "r") as f:
+      data["sentence"].append(f.read())
+      data["sentiment"].append(re.match("\d+_(\d+)\.txt", file_path).group(1))
+  return pd.DataFrame.from_dict(data)
 
 # Merge positive and negative examples, add a polarity column and shuffle.
 def load_dataset(directory):
-    pos_df = load_directory_data(os.path.join(directory, "pos"))
-    neg_df = load_directory_data(os.path.join(directory, "neg"))
-    pos_df["polarity"] = 1
-    neg_df["polarity"] = 0
-    return pd.concat([pos_df, neg_df]).sample(frac=1).reset_index(drop=True)
-
+  pos_df = load_directory_data(os.path.join(directory, "pos"))
+  neg_df = load_directory_data(os.path.join(directory, "neg"))
+  pos_df["polarity"] = 1
+  neg_df["polarity"] = 0
+  return pd.concat([pos_df, neg_df]).sample(frac=1).reset_index(drop=True)
 
 # Download and process the dataset files.
 def download_and_load_datasets(force_download=False):
-    dataset = tf.keras.utils.get_file(
-        fname="aclImdb.tar.gz",
-        origin="http://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz",
-        extract=True,
-    )
+  dataset = tf.keras.utils.get_file(
+      fname="aclImdb.tar.gz", 
+      origin="http://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz", 
+      extract=True)
 
-    train_df = load_dataset(os.path.join(os.path.dirname(dataset), "aclImdb", "train"))
-    test_df = load_dataset(os.path.join(os.path.dirname(dataset), "aclImdb", "test"))
+  train_df = load_dataset(os.path.join(os.path.dirname(dataset), 
+                                       "aclImdb", "train"))
+  test_df = load_dataset(os.path.join(os.path.dirname(dataset), 
+                                      "aclImdb", "test"))
 
-    return train_df, test_df
+  return train_df, test_df
+
+# Reduce logging output.
+tf.logging.set_verbosity(tf.logging.ERROR)
+
+train_df, test_df = download_and_load_datasets()
+train_df.head()
+
+
+# In[3]:
+
+
+# Create datasets (Only take up to max_seq_length words for memory)
+train_text = train_df['sentence'].tolist()
+train_text = [' '.join(t.split()[0:max_seq_length]) for t in train_text]
+train_text = np.array(train_text, dtype=object)[:, np.newaxis]
+train_label = train_df['polarity'].tolist()
+
+test_text = test_df['sentence'].tolist()
+test_text = [' '.join(t.split()[0:max_seq_length]) for t in test_text]
+test_text = np.array(test_text, dtype=object)[:, np.newaxis]
+test_label = test_df['polarity'].tolist()
+
+
+# # Tokenize
+# 
+# Next, tokenize our text to create `input_ids`, `input_masks`, and `segment_ids`
+
+# In[4]:
 
 
 class PaddingInputExample(object):
@@ -56,7 +121,6 @@ class PaddingInputExample(object):
   We use this class instead of `None` because treating `None` as padding
   battches could cause silent errors.
   """
-
 
 class InputExample(object):
     """A single training/test example for simple sequence classification."""
@@ -77,17 +141,18 @@ class InputExample(object):
         self.text_b = text_b
         self.label = label
 
-
-def create_tokenizer_from_hub_module(bert_path):
+def create_tokenizer_from_hub_module():
     """Get the vocab file and casing info from the Hub module."""
-    bert_module = hub.Module(bert_path)
+    bert_module =  hub.Module(bert_path)
     tokenization_info = bert_module(signature="tokenization_info", as_dict=True)
     vocab_file, do_lower_case = sess.run(
-        [tokenization_info["vocab_file"], tokenization_info["do_lower_case"]]
+        [
+            tokenization_info["vocab_file"],
+            tokenization_info["do_lower_case"],
+        ]
     )
 
     return FullTokenizer(vocab_file=vocab_file, do_lower_case=do_lower_case)
-
 
 def convert_single_example(tokenizer, example, max_seq_length=256):
     """Converts a single `InputExample` into a single `InputFeatures`."""
@@ -131,12 +196,11 @@ def convert_single_example(tokenizer, example, max_seq_length=256):
 
     return input_ids, input_mask, segment_ids, example.label
 
-
 def convert_examples_to_features(tokenizer, examples, max_seq_length=256):
     """Convert a set of `InputExample`s to a list of `InputFeatures`."""
 
     input_ids, input_masks, segment_ids, labels = [], [], [], []
-    for example in tqdm(examples, desc="Converting examples to features"):
+    for example in tqdm_notebook(examples, desc="Converting examples to features"):
         input_id, input_mask, segment_id, label = convert_single_example(
             tokenizer, example, max_seq_length
         )
@@ -151,7 +215,6 @@ def convert_examples_to_features(tokenizer, examples, max_seq_length=256):
         np.array(labels).reshape(-1, 1),
     )
 
-
 def convert_text_to_examples(texts, labels):
     """Create InputExamples"""
     InputExamples = []
@@ -161,12 +224,28 @@ def convert_text_to_examples(texts, labels):
         )
     return InputExamples
 
+# Instantiate tokenizer
+tokenizer = create_tokenizer_from_hub_module()
 
-class BertLayer(tf.layers.Layer):
+# Convert data to InputExample format
+train_examples = convert_text_to_examples(train_text, train_label)
+test_examples = convert_text_to_examples(test_text, test_label)
+
+# Convert to features
+(train_input_ids, train_input_masks, train_segment_ids, train_labels 
+) = convert_examples_to_features(tokenizer, train_examples, max_seq_length=max_seq_length)
+(test_input_ids, test_input_masks, test_segment_ids, test_labels
+) = convert_examples_to_features(tokenizer, test_examples, max_seq_length=max_seq_length)
+
+
+# In[5]:
+
+
+class BertLayer(tf.keras.layers.Layer):
     def __init__(
         self,
         n_fine_tune_layers=10,
-        pooling="mean",
+        pooling="first",
         bert_path="https://tfhub.dev/google/bert_uncased_L-12_H-768_A-12/1",
         **kwargs,
     ):
@@ -255,23 +334,25 @@ class BertLayer(tf.layers.Layer):
         return (input_shape[0], self.output_size)
 
 
+# In[6]:
+
+
 # Build model
-def build_model(max_seq_length):
+def build_model(max_seq_length): 
     in_id = tf.keras.layers.Input(shape=(max_seq_length,), name="input_ids")
     in_mask = tf.keras.layers.Input(shape=(max_seq_length,), name="input_masks")
     in_segment = tf.keras.layers.Input(shape=(max_seq_length,), name="segment_ids")
     bert_inputs = [in_id, in_mask, in_segment]
-
-    bert_output = BertLayer(n_fine_tune_layers=3)(bert_inputs)
-    dense = tf.keras.layers.Dense(256, activation="relu")(bert_output)
-    pred = tf.keras.layers.Dense(1, activation="sigmoid")(dense)
-
+    
+    bert_output = BertLayer(n_fine_tune_layers=3, pooling="first")(bert_inputs)
+    dense = tf.keras.layers.Dense(256, activation='relu')(bert_output)
+    pred = tf.keras.layers.Dense(1, activation='sigmoid')(dense)
+    
     model = tf.keras.models.Model(inputs=bert_inputs, outputs=pred)
-    model.compile(loss="binary_crossentropy", optimizer="adam", metrics=["accuracy"])
+    model.compile(loss='binary_crossentropy', optimizer='adam', metrics=['accuracy'])
     model.summary()
-
+    
     return model
-
 
 def initialize_vars(sess):
     sess.run(tf.local_variables_initializer())
@@ -280,65 +361,47 @@ def initialize_vars(sess):
     K.set_session(sess)
 
 
-def main():
-    # Params for bert model and tokenization
-    bert_path = "https://tfhub.dev/google/bert_uncased_L-12_H-768_A-12/1"
-    max_seq_length = 256
-
-    train_df, test_df = download_and_load_datasets()
-
-    # Create datasets (Only take up to max_seq_length words for memory)
-    train_text = train_df["sentence"].tolist()
-    train_text = [" ".join(t.split()[0:max_seq_length]) for t in train_text]
-    train_text = np.array(train_text, dtype=object)[:, np.newaxis]
-    train_label = train_df["polarity"].tolist()
-
-    test_text = test_df["sentence"].tolist()
-    test_text = [" ".join(t.split()[0:max_seq_length]) for t in test_text]
-    test_text = np.array(test_text, dtype=object)[:, np.newaxis]
-    test_label = test_df["polarity"].tolist()
-
-    # Instantiate tokenizer
-    tokenizer = create_tokenizer_from_hub_module(bert_path)
-
-    # Convert data to InputExample format
-    train_examples = convert_text_to_examples(train_text, train_label)
-    test_examples = convert_text_to_examples(test_text, test_label)
-
-    # Convert to features
-    (
-        train_input_ids,
-        train_input_masks,
-        train_segment_ids,
-        train_labels,
-    ) = convert_examples_to_features(
-        tokenizer, train_examples, max_seq_length=max_seq_length
-    )
-    (
-        test_input_ids,
-        test_input_masks,
-        test_segment_ids,
-        test_labels,
-    ) = convert_examples_to_features(
-        tokenizer, test_examples, max_seq_length=max_seq_length
-    )
-
-    model = build_model(max_seq_length)
-
-    # Instantiate variables
-    initialize_vars(sess)
-
-    model.fit(
-        [train_input_ids, train_input_masks, train_segment_ids],
-        train_labels,
-        validation_data=(
-            [test_input_ids, test_input_masks, test_segment_ids],
-            test_labels,
-        ),
-        epochs=1,
-        batch_size=32,
-    )
+# In[ ]:
 
 
-if __name__ == "__main__":
-    main()
+model = build_model(max_seq_length)
+
+# Instantiate variables
+initialize_vars(sess)
+
+model.fit(
+    [train_input_ids, train_input_masks, train_segment_ids], 
+    train_labels,
+    validation_data=([test_input_ids, test_input_masks, test_segment_ids], test_labels),
+    epochs=1,
+    batch_size=16
+)
+
+
+# In[ ]:
+
+
+model.save('BertModel.h5')
+pre_save_preds = model.predict([test_input_ids[0:100], 
+                                test_input_masks[0:100], 
+                                test_segment_ids[0:100]]
+                              ) # predictions before we clear and reload model
+
+# Clear and load model
+model = None
+model = build_model(max_seq_length)
+initialize_vars(sess)
+model.load_weights('BertModel.h5')
+
+post_save_preds = model.predict([test_input_ids[0:100], 
+                                test_input_masks[0:100], 
+                                test_segment_ids[0:100]]
+                              ) # predictions after we clear and reload model
+all(pre_save_preds == post_save_preds) # Are they the same?
+
+
+# In[ ]:
+
+
+
+
